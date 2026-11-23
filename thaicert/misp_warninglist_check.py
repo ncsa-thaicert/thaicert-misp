@@ -124,7 +124,7 @@ logger.propagate = False
 
 _fmt = logging.Formatter(LOG_FORMAT)
 
-_ch = logging.StreamHandler()
+_ch = logging.StreamHandler(sys.stdout)
 _ch.setFormatter(_fmt)
 logger.addHandler(_ch)
 

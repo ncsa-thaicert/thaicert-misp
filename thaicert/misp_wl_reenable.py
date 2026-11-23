@@ -44,7 +44,7 @@ REASONS        = ("user_content", "url_host", "other")
 # Reuse the checker's logger/format but write to this script's own log file
 log = wl.logger
 log.handlers.clear()
-for h in (logging.StreamHandler(), logging.FileHandler(wl.SCRIPT_DIR / "misp_wl_reenable.log", encoding="utf-8")):
+for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(wl.SCRIPT_DIR / "misp_wl_reenable.log", encoding="utf-8")):
     h.setFormatter(wl._fmt)
     log.addHandler(h)
 
