@@ -1,0 +1,22 @@
+[misp]
+# MISP instance URL (no trailing slash)
+url = https://localhost
+
+# API key — find this in MISP → Administration → Auth Keys
+api_key = YOUR_MISP_API_KEY
+
+# Set to True if using a valid SSL certificate
+verify_ssl = False
+
+[tuning]
+# Number of attributes to fetch per API page (higher = faster, more memory)
+page_size = 2500
+
+# Number of values to check per warninglist batch API call
+wl_batch_size = 500
+
+# Number of retry attempts on API failure
+retry_attempts = 3
+
+# Base delay in seconds between retries (doubles each attempt)
+retry_delay = 2

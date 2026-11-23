@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MISP IOC Retirement Workflow</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+  </script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.6;
+      color: #1f2937;
+      background-color: #f9fafb;
+      margin: 0;
+      padding: 2rem;
+    }
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+      background: #ffffff;
+      padding: 2.5rem;
+      border-radius: 12px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    }
+    h1 {
+      color: #111827;
+      border-bottom: 2px solid #e5e7eb;
+      padding-bottom: 0.75rem;
+      font-size: 1.85rem;
+    }
+    h2 {
+      color: #1e40af;
+      margin-top: 2rem;
+      font-size: 1.4rem;
+    }
+    h3 {
+      color: #374151;
+      font-size: 1.15rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.25rem 0;
+    }
+    th, td {
+      border: 1px solid #e5e7eb;
+      padding: 0.75rem 1rem;
+      text-align: left;
+    }
+    th {
+      background-color: #f3f4f6;
+      color: #374151;
+      font-weight: 600;
+    }
+    tr:nth-child(even) {
+      background-color: #f9fafb;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.5rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .badge-keep {
+      background-color: #d1fae5;
+      color: #065f46;
+    }
+    .badge-retire {
+      background-color: #fee2e2;
+      color: #991b1b;
+    }
+    .badge-info {
+      background-color: #dbeafe;
+      color: #1e40af;
+    }
+    .mermaid-box {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin: 1.5rem 0;
+      overflow-x: auto;
+    }
+    .note-box {
+      background-color: #eff6ff;
+      border-left: 4px solid #3b82f6;
+      padding: 1rem 1.25rem;
+      border-radius: 0 8px 8px 0;
+      margin: 1.25rem 0;
+    }
+    code {
+      background: #f3f4f6;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+      color: #b91c1c;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>เอกสารขั้นตอนการทำงานระบบปลดระวาง IOC (MISP IOC Retirement Workflow)</h1>
+    <p>เอกสารแสดงขั้นตอนการทำงานและสถาปัตยกรรมของสคริปต์ <code>misp_ioc_retirement.py</code> สำหรับนำเสนอหรือใช้งานอ้างอิงในการปฏิบัติงาน</p>
+
+    <div class="note-box">
+      <strong>หลักการสำคัญ:</strong> สคริปต์นี้จะไม่ปลดระวาง IOC สุ่มสี่สุ่มห้าตามอายุเท่านั้น แต่จะนำ IOC ที่หมดอายุไปตรวจสอบซ้ำ (Enrichment Re-validation) กับฐานข้อมูล Threat Intelligence ภายนอกก่อนเสมอ หากระบบภายนอกล่มหรือไม่สามารถติดต่อได้ จะใช้หลักการ <strong>Safety-Fail (คงสถานะไว้)</strong> เพื่อความมั่นคงปลอดภัยสูงสุด
+    </div>
+
+    <h2>1. แผนภาพขั้นตอนการทำงาน (Workflow Flowchart)</h2>
+    <div class="mermaid-box">
+      <div class="mermaid">
+flowchart TD
+    subgraph Phase1 ["1. การเริ่มต้นและตรวจสอบสิทธิ์ (Initialization & Locking)"]
+        Start(["เริ่มทำงาน (main)"]) --> CheckLock{"ตรวจสอบ Process Lock<br/>(/tmp/misp_ioc_retirement.lock)"}
+        CheckLock -->|"มี process อื่นรันอยู่"| ExitLock(["จบการทำงานทันที (Exit)"])
+        CheckLock -->|"ล็อกสำเร็จ"| LoadEnv["โหลดการตั้งค่าจาก .env"]
+        LoadEnv --> LoadWL["โหลด Whitelist (.txt และ .env)"]
+        LoadWL --> ConnectMISP{"เชื่อมต่อ MISP API"}
+        ConnectMISP -->|"ล้มเหลว"| ExitErr(["บันทึก Error & จบการทำงาน"])
+        ConnectMISP -->|"สำเร็จ"| FetchAttr["ดึง Attributes จาก MISP<br/>(จำกัด MAX_ATTRS_PER_RUN)"]
+    end
+
+    subgraph Phase2 ["2. การคัดกรองรายการหมดอายุ (Candidate Filtering)"]
+        FetchAttr --> LoopAttr["วนลูปตรวจสอบทีละ Attribute"]
+        LoopAttr --> CheckOrg{"orgc_id ตรงกับ<br/>OWNER_ORG_ID หรือไม่?"}
+        CheckOrg -->|"ไม่ใช่"| SkipAttr["ข้าม (Skip)"]
+        CheckOrg -->|"ใช่"| CheckToIds{"to_ids == True ?"}
+        CheckToIds -->|"ไม่ใช่ (ปิดอยู่แล้ว)"| SkipAttr
+        CheckToIds -->|"ใช่"| CheckWL{"อยู่ใน Whitelist<br/>หรือไม่?"}
+        CheckWL -->|"อยู่ใน Whitelist"| AddCand["เพิ่มเข้าคิว Candidates"]
+        CheckWL -->|"ไม่อยู่ใน Whitelist"| CheckAge{"คำนวณอายุ (วัน) > เกณฑ์กำหนด?<br/>- IP: > 30 วัน<br/>- Domain/URL: > 90 วัน<br/>- Hash: > 180 วัน"}
+        CheckAge -->|"ไม่เกินเกณฑ์"| SkipAttr
+        CheckAge -->|"เกินเกณฑ์ (Stale)"| AddCand
+        SkipAttr --> NextAttr{"มี Attribute ถัดไป?"}
+        AddCand --> NextAttr
+        NextAttr -->|"มี"| LoopAttr
+        NextAttr -->|"หมดแล้ว"| CheckCandCount{"มี Candidates<br/>หรือไม่?"}
+        CheckCandCount -->|"ไม่มี (0 รายการ)"| DoneNoCand(["สิ้นสุดการทำงาน"])
+        CheckCandCount -->|"มี (> 0)"| SortCand["เรียงลำดับ Candidates<br/>ตามอายุ (เก่าที่สุดขึ้นก่อน)"]
+    end
+
+    subgraph Phase3 ["3. ตรวจสอบความเคลื่อนไหว (Enrichment Re-validation)"]
+        SortCand --> LoopCand["วนลูปประมวลผลทีละ Candidate"]
+        LoopCand --> IsCandWL{"เป็นรายการจาก<br/>Whitelist หรือไม่?"}
+        IsCandWL -->|"ใช่ (Whitelist)"| ForceRetire["กำหนด active = False ทันที"]
+        IsCandWL -->|"ไม่ใช่"| CheckA{"1. ตรวจ Provider A API<br/>(IP, Domain, URL, SHA256)"}
+        
+        CheckA -->|"เสี่ยง (malicious_score > 0)"| ResActive["active = True"]
+        CheckA -->|"Benign / 404 / Score=0 / ข้าม"| CheckB{"2. เป็น URL & มี Key ?<br/>ตรวจ Provider B API"}
+        
+        CheckB -->|"Status = online"| ResActive
+        CheckB -->|"No results / ข้าม"| CheckMB{"3. เป็น Hash & มี Key ?<br/>ตรวจ Provider C API"}
+        
+        CheckMB -->|"Query status = ok"| ResActive
+        CheckMB -->|"Hash not found / ข้าม"| CheckD{"4. ตรวจ Provider D<br/>(Fallback สำหรับทุกประเภท)"}
+        
+        CheckD -->|"พบ Pulse > 0"| ResActive
+        CheckD -->|"Not found (404)"| ResInactive["active = False"]
+        
+        CheckA -->|"API Error / Timeout"| CheckB
+        CheckB -->|"API Error"| CheckMB
+        CheckMB -->|"API Error"| CheckD
+        CheckD -->|"API Error"| CheckAllErr{"ทุก API เกิด Error<br/>ทั้งหมดหรือไม่?"}
+        CheckAllErr -->|"ใช่ (Checked = 0)"| ResSafety["active = None<br/>(Safety-fail)"]
+        CheckAllErr -->|"ไม่ใช่ (มีบาง API ระบุว่าไม่พบ)"| ResInactive
+    end
+
+    subgraph Phase4 ["4. การดำเนินการและสรุปผล (Action & Finalization)"]
+        ResActive --> KeepActive["KEEP: ภัยคุกคามยังเคลื่อนไหว<br/>(คงสถานะเดิมไว้ใช้งานต่อ)"]
+        ResSafety --> KeepSafety["KEEP: ระบบตรวจล้มเหลว<br/>(คงสถานะเดิมไว้เพื่อความปลอดภัย)"]
+        
+        ForceRetire --> ActionBranch
+        ResInactive --> ActionBranch{"ผลตรวจ: ไม่พบความเคลื่อนไหว"}
+        
+        ActionBranch --> CheckDryRun{"DRY_RUN = True ?"}
+        CheckDryRun -->|"ใช่ (Dry Run)"| LogDryRun["บันทึก Log เท่านั้น<br/>(ไม่มีการแก้ไขจริง)"]
+        CheckDryRun -->|"ไม่ใช่ (ทำงานจริง)"| CheckWLAction{"เป็น Whitelist และ<br/>WHITELIST_ACTION = 'remove' ?"}
+        
+        CheckWLAction -->|"ใช่"| DeleteAttr["ลบ Attribute ออกจาก MISP<br/>(misp.delete_attribute)"]
+        CheckWLAction -->|"ไม่ใช่"| DisableAttr["ปิดการใช้งาน (Soft-disable)<br/>ตั้งค่า to_ids = False"]
+        
+        DeleteAttr --> RecordEvent["เก็บ Event ID ลงรายการ<br/>events_to_publish"]
+        DisableAttr --> RecordEvent
+        
+        KeepActive --> SleepDelay["หน่วงเวลา (API_DELAY = 0.3s)"]
+        KeepSafety --> SleepDelay
+        LogDryRun --> SleepDelay
+        RecordEvent --> SleepDelay
+        
+        SleepDelay --> NextCand{"มี Candidate ถัดไป?"}
+        NextCand -->|"มี"| LoopCand
+        NextCand -->|"ครบแล้ว"| PublishCheck{"DRY_RUN = False และมี<br/>Event ที่ถูกแก้ไข ?"}
+        
+        PublishCheck -->|"ใช่"| PublishEvents["Republish Events ทั้งหมด<br/>(misp.publish, alert=False)"]
+        PublishCheck -->|"ไม่ใช่"| Summary["แสดงสรุปผลและบันทึก Log File"]
+        PublishEvents --> Summary
+        Summary --> ReleaseLock["ปลด Process Lock"]
+        ReleaseLock --> End(["สิ้นสุดการทำงาน"])
+    end
+      </div>
+    </div>
+
+    <h2>2. เกณฑ์อายุของ IOC (Tiered Age Thresholds)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>หมวดหมู่</th>
+          <th>Attribute Types</th>
+          <th>เกณฑ์อายุ</th>
+          <th>เหตุผล</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>IP</strong></td>
+          <td><code>ip-src</code>, <code>ip-dst</code>, <code>ip-src|port</code>, <code>ip-dst|port</code></td>
+          <td><span class="badge badge-info">30 วัน</span></td>
+          <td>IP มีอัตราการหมุนเวียนและเปลี่ยนเจ้าของบ่อย</td>
+        </tr>
+        <tr>
+          <td><strong>Domain</strong></td>
+          <td><code>domain</code>, <code>hostname</code>, <code>domain|ip</code></td>
+          <td><span class="badge badge-info">90 วัน</span></td>
+          <td>โดเมนของผู้โจมตีมักถูกยึดหรือละทิ้งหลังสิ้นสุดแคมเปญ</td>
+        </tr>
+        <tr>
+          <td><strong>URL</strong></td>
+          <td><code>url</code>, <code>uri</code></td>
+          <td><span class="badge badge-info">90 วัน</span></td>
+          <td>Phishing link หรือ C2 endpoint มักถูกปิดตัวอย่างรวดเร็ว</td>
+        </tr>
+        <tr>
+          <td><strong>Hash</strong></td>
+          <td><code>md5</code>, <code>sha1</code>, <code>sha256</code>, <code>sha512</code> ฯลฯ</td>
+          <td><span class="badge badge-info">180 วัน</span></td>
+          <td>มัลแวร์ Hash ไม่เปลี่ยนแปลง แต่อายุ 180 วันช่วยลดภาระ Feed ปลายทาง</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>3. ลำดับการตรวจสอบ Threat Intelligence</h2>
+    <ol>
+      <li><strong>Provider A API:</strong> ตรวจสอบ IP, Domain, URL, SHA256 (เร็วและครอบคลุมที่สุด หากพบว่ามีความเสี่ยง <code>malicious_score > 0</code> จะ <strong>KEEP</strong> ทันที)</li>
+      <li><strong>Provider B API:</strong> ตรวจสอบเฉพาะ URL (หากสถานะเป็น <code>online</code> จะ <strong>KEEP</strong> ทันที)</li>
+      <li><strong>Provider C API:</strong> ตรวจสอบเฉพาะ File Hash (หากพบตัวอย่างจะ <strong>KEEP</strong> ทันที)</li>
+      <li><strong>Provider D API:</strong> ตรวจสอบทุกประเภท (หากพบ Pulse > 0 จะ <strong>KEEP</strong> หาก 404 จะ <strong>RETIRE</strong>)</li>
+    </ol>
+
+    <h2>4. ผลลัพธ์และการดำเนินการ</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ผลการประเมิน</th>
+          <th>สถานะ</th>
+          <th>การดำเนินการใน MISP</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>ยังพบความเคลื่อนไหวใน Threat Intel</td>
+          <td><span class="badge badge-keep">KEEP</span></td>
+          <td>ไม่เปลี่ยนแปลง คงสถานะ <code>to_ids = True</code> ไว้ใช้งานต่อ</td>
+        </tr>
+        <tr>
+          <td>API Error / Timeout / Rate Limit</td>
+          <td><span class="badge badge-keep">SAFETY KEEP</span></td>
+          <td>คงสถานะไว้เพื่อความปลอดภัย ไม่ปลดระวางผิดพลาด</td>
+        </tr>
+        <tr>
+          <td>ไม่พบความเคลื่อนไหว (Offline / Benign / 404)</td>
+          <td><span class="badge badge-retire">RETIRE</span></td>
+          <td><strong>Soft-disable:</strong> ปรับ <code>to_ids = False</code> และ Republish Event</td>
+        </tr>
+        <tr>
+          <td>อยู่ในรายการ Whitelist</td>
+          <td><span class="badge badge-retire">WHITELIST</span></td>
+          <td>ปรับ <code>to_ids = False</code> หรือลบทิ้งตามที่ตั้งค่า <code>WHITELIST_ACTION</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

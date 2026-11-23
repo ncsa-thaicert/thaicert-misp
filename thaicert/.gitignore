@@ -1,0 +1,14 @@
+.env
+*.ini
+!*.ini.example
+*.log
+*.log.*
+logs/
+data/
+*.csv
+*.sqlite
+*.bak*
+crontab.bak*
+__pycache__/
+*.pyc
+nohup.out
