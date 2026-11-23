@@ -23,8 +23,10 @@ This folder is the only ThaiCERT addition to the repository. Everything outside 
 
 ### `misp_ioc_retirement.py`
 
-- Covers only attributes owned by `OWNER_ORG_ID` that are still `to_ids=True`.
-- Age thresholds come from `.env`: IP 30 days, domain/URL 90, hash 180, anything else 90.
+- MISP filters on the server side: attributes owned by `OWNER_ORG_ID`, still `to_ids=True`, of an IP/domain/URL/hash type, and older than that category's threshold (IP 30 days, domain/URL 90, hash 180). Results are paged, so the whole database is covered.
+- Each run checks at most `MAX_CHECKS_PER_RUN` candidates, taken round-robin across the four categories.
+- An IOC that a run **keeps** is recorded in `data/retirement_state.json` and skipped for `RECHECK_DAYS`, so later runs move on to the rest of the backlog. Dry runs do not write the state.
+- Composite values are split before lookup: `ip|port` → IP, `domain|ip` → domain, `filename|hash` → hash. IPv6 addresses go to the IPv6 endpoint. A value that cannot be parsed is safety-kept.
 - Each candidate is checked against the providers in order **A → B (URLs) / C (hashes) → D** and kept as soon as any provider says it is still active.
 - **Safety-keep:** if every provider fails or times out, the IOC is kept, never retired.
 - Values in `whitelist/*.txt` or `WHITELIST_IOCS` are always disabled, or deleted if `WHITELIST_ACTION=remove`.
@@ -78,14 +80,19 @@ chmod 600 .env misp_warninglist_check.ini
 | `OWNER_ORG_ID` | `1` | Only this org's events are retired |
 | `DRY_RUN` | `True` | `False` = actually disable and republish |
 | `IP_/DOMAIN_/URL_/HASH_/DEFAULT_AGE_THRESHOLD` | 30/90/90/180/90 | Days |
+| `MAX_CHECKS_PER_RUN` | `200` | Candidates enrichment-checked per run |
+| `RECHECK_DAYS` | `30` | Don't re-check an IOC kept less than this many days ago |
+| `PAGE_SIZE` | `1000` | MISP search page size |
 | `API_DELAY_SECONDS` | `0.3` | Pause between candidates |
-| `LOG_FILE` | `logs/misp_cleanup.log` | Retirement log |
+| `HTTP_TIMEOUT` | `12` | Per-request timeout for providers (seconds) |
+| `RETIREMENT_STATE_FILE` | `data/retirement_state.json` | Last-checked time of kept IOCs |
+| `LOG_FILE` | `logs/misp_cleanup.log` | Retirement log (rotates at 10 MB, 5 kept) |
 | `WHITELIST_ACTION` | `disable` | `remove` **deletes** whitelisted attributes |
 | `WHITELIST_IOCS` | | Comma-separated extra whitelist values |
 | `CLEAN_HASH_LIST_NAME` | `Clean hash feed` | Label written into MISP comments. Changing it on a running system stops `misp_wl_reenable.py` recognising older comments. |
 | `CLEAN_HASH_DELAY_SECONDS` | `0.5` | Pause between hourly feed calls |
 
-`MAX_CHECKS_PER_RUN` appears in `.env.example` but the retirement script does not read it yet, so every candidate is checked.
+The backlog is large: about 177,000 stale candidates in November 2026. At 200 checks a week, each check lasting a few seconds, it takes years to work through. Raise `MAX_CHECKS_PER_RUN` (and run more often) as far as the providers' rate limits allow.
 
 ## Usage
 
@@ -97,7 +104,7 @@ All scripts **dry-run by default** (retirement follows `DRY_RUN`).
 ./misp_warninglist_check.py --commit --days 1   # apply (what cron runs)
 ./misp_warninglist_check.py --no-clean-hash     # warninglists only
 
-DRY_RUN=True ./misp_ioc_retirement.py           # test run; the variable overrides .env
+DRY_RUN=True MAX_CHECKS_PER_RUN=10 ./misp_ioc_retirement.py   # small test run; variables override .env
 
 ./clean_hash_feed.py                            # collect
 ./clean_hash_feed.py --stats                    # store size, newest release, last fetch
@@ -111,10 +118,12 @@ DRY_RUN=True ./misp_ioc_retirement.py           # test run; the variable overrid
 `/var/www/MISP` is a clone of this repository: `origin` is upstream MISP and `thaicert` is `ncsa-thaicert/thaicert-misp`. The scripts run from `/var/www/MISP/thaicert` under the `piyawut` user's crontab:
 
 ```cron
-0 19 * * *  cd /var/www/MISP/thaicert && flock -n /tmp/misp_wl.lock ./misp_warninglist_check.py --commit --days 1 >> /var/www/MISP/thaicert/logs/misp_warninglist_check.log 2>&1
-0 22 * * 6  cd /var/www/MISP/thaicert && flock -n /tmp/misp_retire.lock ./misp_ioc_retirement.py >> /var/www/MISP/thaicert/logs/misp_cleanup.log 2>&1
+0 19 * * *  cd /var/www/MISP/thaicert && flock -n /tmp/misp_wl.lock ./misp_warninglist_check.py --commit --days 1 >/dev/null 2>> /var/www/MISP/thaicert/logs/misp_warninglist_check.err
+0 22 * * 6  cd /var/www/MISP/thaicert && flock -n /tmp/misp_retire.lock ./misp_ioc_retirement.py >/dev/null 2>> /var/www/MISP/thaicert/logs/misp_cleanup.err
 20 * * * *  cd /var/www/MISP/thaicert && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> /var/www/MISP/thaicert/logs/clean_hash_feed.err
 ```
+
+Each script writes its own rotating log, so cron discards stdout. Only stderr (tracebacks, crashes) goes to the `logs/*.err` files; if stdout were also appended to the log, every line would appear twice.
 
 Runtime files sit next to the scripts and are git-ignored:
 
@@ -122,7 +131,10 @@ Runtime files sit next to the scripts and are git-ignored:
 |---|---|
 | `.env`, `misp_warninglist_check.ini` | secrets (mode 600) |
 | `data/clean_hash_feed.sqlite` | clean-hash store (~5 GB) |
-| `logs/`, `misp_warninglist_check.log*`, `misp_wl_reenable.log` | logs |
+| `data/retirement_state.json` | retirement re-check state |
+| `misp_warninglist_check.log*` | warninglist checker log (rotating) |
+| `logs/misp_cleanup.log*`, `logs/clean_hash_feed.log*`, `misp_wl_reenable.log` | other script logs |
+| `logs/*.err` | stderr from cron runs |
 | `misp_wl_report_*.csv`, `misp_wl_reenable_*.csv` | run reports (`misp_wl_reenable.py` reads the `misp_wl_report_*` ones) |
 
 ### Making changes
@@ -146,7 +158,7 @@ cd /var/www/MISP/thaicert
 /var/www/MISP/venv/bin/python3 -m unittest discover -s tests -t .
 ```
 
-The tests cover the clean-hash collector (parsing, planning, retries, store) and the matcher and re-enable logic. They make no network calls and need no MISP.
+The tests cover the clean-hash collector (parsing, planning, retries, store), the matcher and re-enable logic, and retirement candidate selection (value splitting, pagination, round-robin cap, re-check state). They make no network calls and need no MISP.
 
 ## Security
 

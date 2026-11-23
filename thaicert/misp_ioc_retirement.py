@@ -3,22 +3,25 @@
 MISP IOC Retirement Script (with Enrichment & Retry Logic)
 Author: Antigravity
 Description:
-  1. Fetches ALL attributes from MISP owned by OWNER_ORG_ID; skips already-disabled ones.
-  2. Filters by tiered age thresholds: IP=30d, Domain/URL=90d, Hash=180d.
-  3. Re-validates stale candidates against up to four configurable enrichment providers (A-D).
+  1. Asks MISP (server-side filters, paginated) for to_ids=True attributes owned by
+     OWNER_ORG_ID that are older than their category threshold:
+     IP=30d, Domain/URL=90d, Hash=180d. Whitelisted values are fetched separately (any age).
+  2. Takes at most MAX_CHECKS_PER_RUN candidates, round-robin across categories,
+     skipping ones kept by a run less than RECHECK_DAYS ago (state file), so
+     successive runs work through the whole backlog.
+  3. Re-validates them against up to four configurable enrichment providers (A-D).
+     Composite values (ip|port, domain|ip, filename|hash) are split first.
   4. Soft-disables (to_ids=False) confirmed stale IOCs.
   5. Republishes affected events so downstream sync partners pick up the changes.
-Optimizations:
-  - Pre-computed threshold dict (no rebuild per call).
-  - Simplified HTTP retry using single session.request() call.
-  - Counter-based enrichment aggregation (no temporary list).
-  - owner_str cached outside the candidate loop.
 """
 
+import ipaddress
+import json
 import os
 import sys
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import requests
 import urllib3
 from pymisp import ExpandedPyMISP
@@ -80,10 +83,14 @@ URL_AGE_THRESHOLD     = int(os.environ.get("URL_AGE_THRESHOLD",      "90"))
 HASH_AGE_THRESHOLD    = int(os.environ.get("HASH_AGE_THRESHOLD",    "180"))
 DEFAULT_AGE_THRESHOLD = int(os.environ.get("DEFAULT_AGE_THRESHOLD",  "90"))
 
-MAX_ATTRS_PER_RUN = int(os.environ.get("MAX_ATTRS_PER_RUN", "5000"))
-API_DELAY         = float(os.environ.get("API_DELAY_SECONDS", "0.3"))
-HTTP_TIMEOUT      = int(os.environ.get("HTTP_TIMEOUT", "12"))
-MAX_HTTP_RETRIES  = 2
+MAX_CHECKS_PER_RUN = int(os.environ.get("MAX_CHECKS_PER_RUN", "200"))   # enrichment-checked candidates per run
+RECHECK_DAYS       = int(os.environ.get("RECHECK_DAYS",       "30"))    # skip IOCs kept less than N days ago
+PAGE_SIZE          = int(os.environ.get("PAGE_SIZE",          "1000"))  # MISP search page size
+STATE_FILE         = os.environ.get("RETIREMENT_STATE_FILE",
+                                    os.path.join(script_dir, "data", "retirement_state.json"))
+API_DELAY          = float(os.environ.get("API_DELAY_SECONDS", "0.3"))
+HTTP_TIMEOUT       = int(os.environ.get("HTTP_TIMEOUT", "12"))
+MAX_HTTP_RETRIES   = 2
 
 # Whitelist configuration
 WHITELIST_DIR    = os.environ.get("WHITELIST_DIR", os.path.join(script_dir, "whitelist"))
@@ -95,13 +102,15 @@ WHITELIST_ACTION = os.environ.get("WHITELIST_ACTION", "disable").lower()  # "dis
 LOG_FILE = os.environ.get("LOG_FILE", os.path.join(script_dir, "logs", "misp_cleanup.log"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+# The script writes its own rotating log; cron should send stdout to /dev/null
+# (otherwise every line lands in the log twice).
+os.makedirs(os.path.dirname(os.path.abspath(LOG_FILE)), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -113,6 +122,12 @@ DOMAIN_TYPES = {"domain", "hostname", "domain|ip"}
 URL_TYPES    = {"url", "uri"}
 HASH_TYPES   = {"md5", "sha1", "sha256", "sha512",
                  "filename|md5", "filename|sha1", "filename|sha256"}
+CATEGORY_TYPES = {
+    "IP":     sorted(IP_TYPES),
+    "DOMAIN": sorted(DOMAIN_TYPES),
+    "URL":    sorted(URL_TYPES),
+    "HASH":   sorted(HASH_TYPES),
+}
 
 # OPT: pre-build threshold dict once at module level — avoids rebuilding on every call
 _THRESHOLD_MAP = {
@@ -131,6 +146,53 @@ def get_category(t):
 
 def get_threshold(cat):
     return _THRESHOLD_MAP.get(cat, DEFAULT_AGE_THRESHOLD)
+
+
+def lookup_value(attr_type, value):
+    """
+    The part of an attribute value that enrichment providers understand, or None
+    if it cannot be checked. Composite types are split:
+      ip-src|port / ip-dst|port -> IP,  domain|ip -> domain,  filename|<hash> -> hash.
+    IP values must parse as an IP address.
+    """
+    value = (value or "").strip()
+    if attr_type in ("ip-src|port", "ip-dst|port", "domain|ip"):
+        value = value.split("|", 1)[0].strip()
+    elif attr_type.startswith("filename|"):
+        value = value.rsplit("|", 1)[-1].strip()
+    if not value:
+        return None
+    if attr_type in IP_TYPES:
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return None
+    return value
+
+
+# ── State: when each kept IOC was last checked ────────────────────────────────
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): int(v) for k, v in data.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning(f"State file {path} unreadable ({e}) — starting with an empty state.")
+        return {}
+
+
+def save_state(path, state, now):
+    """Write the state atomically, dropping entries older than RECHECK_DAYS."""
+    keep_after = now - RECHECK_DAYS * 86400
+    state = {k: v for k, v in state.items() if v > keep_after}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
 
 
 # ── Global HTTP Session with Pooling ──────────────────────────────────────────
@@ -213,7 +275,7 @@ def check_provider_d(category, value):
     """Provider D: indicator API, any IOC category (pulse count > 0 = active)."""
     if not ENRICH_D_ON:
         return None
-    type_map = {"IP": "IPv4", "DOMAIN": "domain", "URL": "url", "HASH": "file"}
+    type_map = {"IP": "IPv6" if ":" in value else "IPv4", "DOMAIN": "domain", "URL": "url", "HASH": "file"}
     ind_type = type_map.get(category)
     if not ind_type:
         return None
@@ -307,9 +369,8 @@ def check_provider_a(category, value, attr_type):
     elif category == "URL":
         endpoint = f"{ENRICH_A_URL}/ioc/api/v1/url"
     elif category == "HASH":
-        if attr_type not in ("sha256", "filename|sha256") or len(value.split("|")[-1]) != 64:
+        if attr_type not in ("sha256", "filename|sha256") or len(value) != 64:
             return None
-        value    = value.split("|")[-1]
         endpoint = f"{ENRICH_A_URL}/ioc/api/v1/file/sha256"
     else:
         return None
@@ -364,8 +425,7 @@ def is_still_active(category, value, attr_type=""):
     Short-circuits as soon as any API confirms the IOC is still active.
     Order: A (fast) → B/C (type-specific) → D (fallback/slow).
     Returns True (keep), False (retire), or None (all APIs errored → safety-keep).
-
-    OPT: uses an integer counter instead of a temporary list to detect all-error case.
+    `value` must already be the lookup value (see lookup_value()).
     """
     checked = 0
 
@@ -409,7 +469,99 @@ def is_still_active(category, value, attr_type=""):
     return False
 
 
+# ── Candidate collection (server-side filtered, paginated) ────────────────────
+def search_attributes(misp, **filters):
+    """Yield attributes matching `filters`, page by page (PAGE_SIZE), with retries."""
+    page = 1
+    while True:
+        for attempt in range(1, 4):
+            try:
+                resp = misp.search(controller="attributes", pythonify=False,
+                                   include_context=False, limit=PAGE_SIZE, page=page, **filters)
+                break
+            except Exception as e:
+                if attempt == 3:
+                    raise
+                log.warning(f"MISP search page {page} failed ({e}); retry {attempt}/2 in {5 * attempt}s")
+                time.sleep(5 * attempt)
+        if isinstance(resp, dict) and resp.get("errors"):
+            raise RuntimeError(f"MISP search error: {resp['errors']}")
+        batch = resp.get("Attribute", []) if isinstance(resp, dict) else (resp or [])
+        yield from batch
+        if len(batch) < PAGE_SIZE:
+            return
+        page += 1
 
+
+def make_candidate(attr, now, is_whitelisted):
+    atype    = attr.get("type", "")
+    category = get_category(atype)
+    ts       = attr.get("timestamp")
+    return {
+        "id":             str(attr.get("id")),
+        "uuid":           attr.get("uuid"),
+        "type":           atype,
+        "category":       category,
+        "value":          attr.get("value", ""),
+        "age_days":       int((now - int(ts)) / 86400) if ts else 9999,
+        "threshold":      get_threshold(category),
+        "event_id":       attr.get("event_id") or attr.get("Event", {}).get("id"),
+        "is_whitelisted": is_whitelisted,
+    }
+
+
+def owned_and_active(attr):
+    """Defensive re-check of the server-side filters."""
+    org = attr.get("Event", {}).get("orgc_id")
+    return (org is None or str(org) == str(OWNER_ORG_ID)) and attr.get("to_ids") in (True, 1, "1")
+
+
+def collect_whitelisted(misp, now):
+    """Active attributes whose value is whitelisted, regardless of age."""
+    if not WHITELIST_IOCS:
+        return []
+    out = []
+    for attr in search_attributes(misp, org=OWNER_ORG_ID, to_ids=True, value=sorted(WHITELIST_IOCS)):
+        if owned_and_active(attr) and attr.get("value", "").strip() in WHITELIST_IOCS:
+            out.append(make_candidate(attr, now, True))
+    log.info(f"Whitelisted active attributes: {len(out)}")
+    return out
+
+
+def collect_stale(misp, now, recent, state, exclude_ids):
+    """
+    Up to MAX_CHECKS_PER_RUN stale candidates, taken round-robin across the
+    IP/DOMAIN/URL/HASH categories. Each category is queried with
+    timestamp <= now - threshold, so MISP returns only stale attributes.
+    Attributes kept by a run after `recent` (per `state`) are skipped.
+    Returns (candidates, attributes_fetched, skipped_recent).
+    """
+    per_cat, fetched, skipped = {}, 0, 0
+    for cat, types in CATEGORY_TYPES.items():
+        cutoff = now - get_threshold(cat) * 86400
+        picked = []
+        for attr in search_attributes(misp, org=OWNER_ORG_ID, to_ids=True,
+                                      type_attribute=types, timestamp=[1, cutoff]):
+            fetched += 1
+            if not owned_and_active(attr) or str(attr.get("id")) in exclude_ids:
+                continue
+            if state.get(attr.get("uuid"), 0) > recent:
+                skipped += 1
+                continue
+            picked.append(make_candidate(attr, now, False))
+            if len(picked) >= MAX_CHECKS_PER_RUN:
+                break
+        per_cat[cat] = picked
+        log.info(f"  {cat:6} stale (>{get_threshold(cat)}d): picked {len(picked)}")
+
+    # Round-robin so one big category cannot starve the others
+    out, i = [], 0
+    while len(out) < MAX_CHECKS_PER_RUN and any(i < len(v) for v in per_cat.values()):
+        for picked in per_cat.values():
+            if i < len(picked) and len(out) < MAX_CHECKS_PER_RUN:
+                out.append(picked[i])
+        i += 1
+    return out, fetched, skipped
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -466,71 +618,39 @@ def main():
             lock_file.close()
         sys.exit(1)
 
-    # ── Fetch ALL attributes; active-flag filtering done in Python ────────────
-    log.info("Fetching all attributes (regardless of to_ids flag) …")
+    now      = int(time.time())
+    state    = load_state(STATE_FILE)
+    recent   = now - RECHECK_DAYS * 86400
+    log.info(
+        f"Limits      MAX_CHECKS_PER_RUN={MAX_CHECKS_PER_RUN}  RECHECK_DAYS={RECHECK_DAYS}  "
+        f"state entries={len(state):,}"
+    )
+
+    # ── Fetch candidates with server-side filters (paginated) ─────────────────
     try:
-        resp = misp.search(controller="attributes",
-                           limit=MAX_ATTRS_PER_RUN, pythonify=False)
-        attributes = resp.get("Attribute", []) if isinstance(resp, dict) else resp
+        whitelist_cands = collect_whitelisted(misp, now)
+        stale_cands, fetched, skipped_recent = collect_stale(
+            misp, now, recent, state, {c["id"] for c in whitelist_cands}
+        )
     except Exception as e:
         log.critical(f"Failed to fetch attributes: {e}")
         if lock_file:
             lock_file.close()
         sys.exit(1)
 
-    total_fetched = len(attributes)
-    log.info(f"Fetched {total_fetched} attribute(s).")
-
-    # ── Filter: org ownership, active flag, whitelist/warninglist, age ─────────
-    now       = time.time()
-    owner_str = str(OWNER_ORG_ID)   # OPT: cast once outside loop
-    candidates = []
-
-    for attr in attributes:
-        event   = attr.get("Event", {})
-
-        # OPT: fastest exits first — skip foreign-org and disabled attrs before any other work
-        if str(event.get("orgc_id", "")) != owner_str:
-            continue
-        if attr.get("to_ids") not in (True, 1, "1"):
-            continue
-
-        attr_value = attr.get("value", "")
-        atype      = attr.get("type", "")
-        ts         = attr.get("timestamp")
-
-        # Whitelist: O(1) set membership
-        is_whitelisted     = attr_value.strip() in WHITELIST_IOCS
-        if not ts and not is_whitelisted:
-            continue
-
-        age_days  = int((now - int(ts)) / 86400) if ts else 9999
-        category  = get_category(atype)
-        threshold = get_threshold(category)
-
-        if is_whitelisted or age_days > threshold:
-            candidates.append({
-                "id":                 attr.get("id"),
-                "type":               atype,
-                "category":           category,
-                "value":              attr_value,
-                "age_days":           age_days,
-                "threshold":          threshold,
-                "event_id":           event.get("id"),
-                "event_info":         event.get("info", ""),
-                "is_whitelisted":     is_whitelisted,
-            })
-
+    candidates       = whitelist_cands + stale_cands
+    total_fetched    = fetched + len(whitelist_cands)
     total_candidates = len(candidates)
-    log.info(f"Found {total_candidates} stale candidate(s) exceeding their age threshold.")
+    log.info(
+        f"Candidates this run: {total_candidates} "
+        f"({len(whitelist_cands)} whitelisted, {len(stale_cands)} stale; "
+        f"{skipped_recent:,} skipped as checked < {RECHECK_DAYS}d ago)"
+    )
     if total_candidates == 0:
         log.info("Nothing to retire. Done.")
         if lock_file:
             lock_file.close()
         return
-
-    # Sort oldest-first for readable, stable log output
-    candidates.sort(key=lambda x: x["age_days"], reverse=True)
 
     # ── Re-validate and retire ────────────────────────────────────────────────
     retired           = 0
@@ -559,15 +679,24 @@ def main():
                 f"[{idx}/{total_candidates}] {cat} ({item['type']})  "
                 f"Age:{age}d > {thr}d  |  {val}"
             )
-            active = is_still_active(cat, val, item["type"])
+            lv = lookup_value(item["type"], val)
+            if lv is None:
+                log.warning(f"  Value not checkable as {item['type']}: {val!r}")
+                active = None
+            else:
+                active = is_still_active(cat, lv, item["type"])
 
         if active is True:
             log.info("  ==> KEEP  (still active in enrichment feeds)")
             kept_enrich += 1
+            if not DRY_RUN and item["uuid"]:
+                state[item["uuid"]] = now
 
         elif active is None:
             log.info("  ==> KEEP  (API error — safety-fail)")
             kept_error += 1
+            if not DRY_RUN and item["uuid"]:
+                state[item["uuid"]] = now
 
         else:  # active is False → retire
             if is_whitelisted and WHITELIST_ACTION == "remove":
@@ -597,9 +726,19 @@ def main():
                         log.error(f"  ==> ERROR updating attr {aid}: {e}")
                         error_update += 1
 
+        # Save progress now and then so a crash does not lose the whole run
+        if not DRY_RUN and idx % 100 == 0:
+            save_state(STATE_FILE, state, now)
+
         # Polite rate-limit delay between enrichment API calls
-        if idx < total_candidates:
+        if idx < total_candidates and not is_whitelisted:
             time.sleep(API_DELAY)
+
+    if not DRY_RUN:
+        try:
+            save_state(STATE_FILE, state, now)
+        except Exception as e:
+            log.error(f"Could not save state file {STATE_FILE}: {e}")
 
     # ── Republish affected events ─────────────────────────────────────────────
     if not DRY_RUN and events_to_publish:
@@ -616,7 +755,8 @@ def main():
     log.info("Summary")
     log.info("=" * 60)
     log.info(f"  Attributes Fetched          : {total_fetched}")
-    log.info(f"  Stale Candidates            : {total_candidates}")
+    log.info(f"  Skipped (checked recently)  : {skipped_recent}")
+    log.info(f"  Candidates Checked          : {total_candidates}")
     log.info(f"  Retired  (to_ids=False)     : {retired}")
     log.info(f"  Kept     (still in feeds)   : {kept_enrich}")
     log.info(f"  Kept     (API error/safety) : {kept_error}")
