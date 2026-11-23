@@ -65,7 +65,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SCRIPT_DIR      = Path("/opt/misp-script")
+SCRIPT_DIR      = Path(__file__).resolve().parent
 WL_DIR          = Path("/var/www/MISP/app/files/warninglists/lists")
 DEFAULT_CONFIG  = SCRIPT_DIR / "misp_warninglist_check.ini"
 AUDIT_TAG       = "warninglist:auto-flagged"
@@ -831,7 +831,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude-keywords", default=",".join(DEFAULT_EXCLUDE_KEYWORDS),
                    help=f"Comma-separated keywords to exclude warninglists (default: {','.join(DEFAULT_EXCLUDE_KEYWORDS)})")
     p.add_argument("--output",           default=None,
-                   help="CSV report output path (default: auto-timestamped in /opt/misp-script/)")
+                   help="CSV report output path (default: auto-timestamped next to this script)")
     p.add_argument("--days",             type=int, default=None,
                    help="Only check attributes modified, or whose event was published/synced, in the last N days (default: check all attributes)")
     p.add_argument("--clean-hash-db",          default=str(clean_hash_feed.DEFAULT_DB),

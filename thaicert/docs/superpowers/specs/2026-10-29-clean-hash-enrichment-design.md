@@ -63,7 +63,7 @@ cron :20 ทุกชั่วโมง                       cron 19:00 ทุ�
 
 ไฟล์เดียว รันเป็นสคริปต์ได้ (collector) และ import ได้ (`CleanHashStore`). Shebang `#!/var/www/MISP/venv/bin/python3`, ใช้แค่ `requests` + standard library
 
-**Config** (อ่านจาก `/opt/misp-script/.env` ด้วย `load_env` แบบเดียวกับ `misp_ioc_retirement.py`):
+**Config** (อ่านจาก `/var/www/MISP/thaicert/.env` ด้วย `load_env` แบบเดียวกับ `misp_ioc_retirement.py`):
 
 | ตัวแปร | Default | หมายเหตุ |
 |---|---|---|
@@ -71,7 +71,7 @@ cron :20 ทุกชั่วโมง                       cron 19:00 ทุ�
 | `CLEAN_HASH_URL` | (required) | |
 | `CLEAN_HASH_DELAY_SECONDS` | `0.5` | หน่วงระหว่าง call (สำคัญตอน backfill) |
 
-**ค่าคงที่**: `DEFAULT_DB = /opt/misp-script/data/clean_hash_feed.sqlite`, `RETENTION_DAYS = 30`, `REFETCH_RECENT_HOURS = 3`
+**ค่าคงที่**: `DEFAULT_DB = /var/www/MISP/thaicert/data/clean_hash_feed.sqlite`, `RETENTION_DAYS = 30`, `REFETCH_RECENT_HOURS = 3`
 
 **Data model** (SQLite, `PRAGMA journal_mode=WAL`, โฟลเดอร์ `data/` = `750`, ไฟล์ DB = `640`):
 
@@ -173,7 +173,7 @@ Exit code: `0` ครบทุกชั่วโมง, `1` มีบางช�
 ใช้ `unittest` (MISP venv ไม่มี pytest และไม่ติดตั้งเพิ่มใน production venv)
 
 ```bash
-cd /opt/misp-script && /var/www/MISP/venv/bin/python3 -m unittest discover -s tests -t .
+cd /var/www/MISP/thaicert && /var/www/MISP/venv/bin/python3 -m unittest discover -s tests -t .
 ```
 
 - Test ต้องปิด handler ของ logger `misp_wl_check` (กันเขียนลง production log) และชี้ `WL_DIR` ไป temp dir ที่มี `list.json` ตัวอย่าง
@@ -196,14 +196,14 @@ cd /opt/misp-script && /var/www/MISP/venv/bin/python3 -m unittest discover -s te
 ## 7. Rollout
 
 1. Backup `misp_warninglist_check.py`, `misp_wl_reenable.py` เป็น `.bak_20261029` (ตาม convention เดิม — ไม่มี git)
-2. ผู้ใช้เพิ่ม `CLEAN_HASH_API_KEY=...` ใน `/opt/misp-script/.env` (ไฟล์นี้ `600` อยู่แล้ว)
+2. ผู้ใช้เพิ่ม `CLEAN_HASH_API_KEY=...` ใน `/var/www/MISP/thaicert/.env` (ไฟล์นี้ `600` อยู่แล้ว)
 3. รัน `./clean_hash_feed.py` ด้วยมือ (backfill 30 วัน) แล้ว `./clean_hash_feed.py --stats` — ดูปริมาณต่อชั่วโมง/rate limit จาก log
 4. วัดผลก่อนแตะ MISP: `./misp_warninglist_check.py` (dry-run, ไม่ใส่ `--days`) ช่วงเวลาที่โหลดน้อย → review CSV ร่วมกัน
 5. ถ้าผลโอเค: `./misp_warninglist_check.py --commit` (full) หนึ่งครั้งเพื่อ catch-up แล้วเพิ่ม cron:
 
    ```
    # clean-hash feed collector - every hour at :20
-   20 * * * * cd /opt/misp-script && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> /opt/misp-script/logs/clean_hash_feed.err
+   20 * * * * cd /var/www/MISP/thaicert && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> /var/www/MISP/thaicert/logs/clean_hash_feed.err
    ```
 
    Cron ของ checker รายวันไม่ต้องแก้ (ใช้ `--clean-hash-db` default)

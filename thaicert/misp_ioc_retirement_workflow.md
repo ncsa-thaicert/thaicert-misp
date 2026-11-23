@@ -1,6 +1,6 @@
 # เอกสารขั้นตอนการทำงานของระบบปลดระวาง IOC (MISP IOC Retirement Workflow)
 
-เอกสารนี้อธิบายสถาปัตยกรรมและขั้นตอนการทำงานของสคริปต์ [`misp_ioc_retirement.py`](file:///opt/misp-script/misp_ioc_retirement.py) ซึ่งใช้สำหรับบริหารจัดการวงจรชีวิต (Lifecycle Management) ของตัวบ่งชี้ภัยคุกคาม (Indicators of Compromise - IOCs) ในระบบ MISP แบบอัตโนมัติ
+เอกสารนี้อธิบายสถาปัตยกรรมและขั้นตอนการทำงานของสคริปต์ [`misp_ioc_retirement.py`](file:///var/www/MISP/thaicert/misp_ioc_retirement.py) ซึ่งใช้สำหรับบริหารจัดการวงจรชีวิต (Lifecycle Management) ของตัวบ่งชี้ภัยคุกคาม (Indicators of Compromise - IOCs) ในระบบ MISP แบบอัตโนมัติ
 
 ---
 

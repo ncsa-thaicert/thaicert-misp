@@ -41,7 +41,7 @@ import requests
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SCRIPT_DIR           = Path("/opt/misp-script")
+SCRIPT_DIR           = Path(__file__).resolve().parent
 DEFAULT_DB           = SCRIPT_DIR / "data" / "clean_hash_feed.sqlite"
 LOG_FILE             = SCRIPT_DIR / "logs" / "clean_hash_feed.log"
 RETENTION_DAYS       = 30
@@ -334,7 +334,7 @@ def main() -> int:
     load_env(SCRIPT_DIR / ".env")
     api_key = os.environ.get("CLEAN_HASH_API_KEY", "").strip()
     if not api_key:
-        logger.error("CLEAN_HASH_API_KEY is not set (add it to /opt/misp-script/.env).")
+        logger.error(f"CLEAN_HASH_API_KEY is not set (add it to {SCRIPT_DIR / '.env'}).")
         return 2
     url   = os.environ.get("CLEAN_HASH_URL", "").strip()
     if not url:

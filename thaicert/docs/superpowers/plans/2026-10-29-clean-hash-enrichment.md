@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- `/opt/misp-script` ไม่ใช่ git repo — แทน commit ด้วย backup `<file>.bak_20261029` ก่อนแก้ไฟล์เดิม (ทำครั้งเดียวต่อไฟล์) และขั้น "Checkpoint" = รัน test ทั้งชุดผ่าน
+- `/var/www/MISP/thaicert` ไม่ใช่ git repo — แทน commit ด้วย backup `<file>.bak_20261029` ก่อนแก้ไฟล์เดิม (ทำครั้งเดียวต่อไฟล์) และขั้น "Checkpoint" = รัน test ทั้งชุดผ่าน
 - ห้ามติดตั้ง package เพิ่มใน MISP venv; test ใช้ `unittest` เท่านั้น
-- รัน test ทุกครั้งจาก `/opt/misp-script`: `/var/www/MISP/venv/bin/python3 -m unittest discover -s tests -t . -v`
+- รัน test ทุกครั้งจาก `/var/www/MISP/thaicert`: `/var/www/MISP/venv/bin/python3 -m unittest discover -s tests -t . -v`
 - Test ต้องไม่เขียน production log: ใน `setUpModule` ให้ `misp_warninglist_check.logger.handlers.clear()` และ `clean_hash_feed` logger เช่นกัน
 - ห้าม log API key ในทุกกรณี
-- ค่าจาก spec: `DEFAULT_DB = /opt/misp-script/data/clean_hash_feed.sqlite`, `RETENTION_DAYS = 30`, `REFETCH_RECENT_HOURS = 3`, `CLEAN_HASH_URL` (required, no default), `CLEAN_HASH_DELAY_SECONDS` default `0.5`, timeout `(10, 120)`, retry backoff `2/4/8` วินาที, stale threshold 24 ชม., `CLEAN_HASH_LIST_NAME` (from .env, default `"Clean hash feed"`), filename ตัดที่ 80 ตัวอักษร
+- ค่าจาก spec: `DEFAULT_DB = /var/www/MISP/thaicert/data/clean_hash_feed.sqlite`, `RETENTION_DAYS = 30`, `REFETCH_RECENT_HOURS = 3`, `CLEAN_HASH_URL` (required, no default), `CLEAN_HASH_DELAY_SECONDS` default `0.5`, timeout `(10, 120)`, retry backoff `2/4/8` วินาที, stale threshold 24 ชม., `CLEAN_HASH_LIST_NAME` (from .env, default `"Clean hash feed"`), filename ตัดที่ 80 ตัวอักษร
 - Exit code collector: `0` ครบ, `1` มีชั่วโมงถูกข้าม, `2` auth/config error
 - Log format เดียวกับ checker: `"%(asctime)s [%(levelname)s] %(message)s"`
 
@@ -312,10 +312,10 @@ def test_only_unmatched_rows_are_candidates(self):
 
 ### Task 6: Rollout (ทำร่วมกับผู้ใช้ — ห้ามแตะ MISP ด้วย `--commit` ก่อนผู้ใช้อนุมัติ)
 
-- [ ] **Step 1:** ผู้ใช้เพิ่ม `CLEAN_HASH_API_KEY=...` ใน `/opt/misp-script/.env`
+- [ ] **Step 1:** ผู้ใช้เพิ่ม `CLEAN_HASH_API_KEY=...` ใน `/var/www/MISP/thaicert/.env`
 - [ ] **Step 2:** `./clean_hash_feed.py` (backfill) — รันในฐานะ `piyawut` เท่านั้น ห้าม sudo (ไม่งั้น `data/` เป็นของ root และ cron อ่านไม่ได้) → exit 0; จด per-hour file count, เวลาที่ใช้, มี 429 หรือไม่ จาก `logs/clean_hash_feed.log`
 - [ ] **Step 3:** `./clean_hash_feed.py --stats` → `files > 0`, `hours_fetched ≈ 719`; สุ่ม 3 hash จาก DB ตรวจว่าเป็นไฟล์ vendor จริง
 - [ ] **Step 4:** `./misp_warninglist_check.py` (dry-run, ไม่ใส่ `--days`) ช่วงโหลดน้อย → นับแถว CSV ที่มี `clean-hash feed` และแถว `filename|sha256`; ส่งสรุปให้ผู้ใช้ตัดสิน
 - [ ] **Step 5 (หลังผู้ใช้อนุมัติ):** `./misp_warninglist_check.py --commit` หนึ่งครั้ง แล้วเพิ่ม cron:
-  `20 * * * * cd /opt/misp-script && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> /opt/misp-script/logs/clean_hash_feed.err`
+  `20 * * * * cd /var/www/MISP/thaicert && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> /var/www/MISP/thaicert/logs/clean_hash_feed.err`
 - [ ] **Step 6:** วันถัดไปตรวจ `logs/misp_warninglist_check.log` ว่ามีบรรทัด `clean-hash store:` และไม่มี stale warning

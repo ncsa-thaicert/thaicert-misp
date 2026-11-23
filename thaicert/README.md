@@ -35,6 +35,18 @@ The scripts expect the MISP virtualenv (`/var/www/MISP/venv/bin/python3`) and re
 ./clean_hash_feed.py [--stats]
 ```
 
+## Deployment (production)
+
+Production runs directly from this checkout: `/var/www/MISP` is a clone of this repository, and the scripts run from `/var/www/MISP/thaicert` via the user crontab:
+
+```
+0 19 * * *  cd /var/www/MISP/thaicert && flock -n /tmp/misp_wl.lock ./misp_warninglist_check.py --commit --days 1 >> logs/misp_warninglist_check.log 2>&1
+0 22 * * 6  cd /var/www/MISP/thaicert && flock -n /tmp/misp_retire.lock ./misp_ioc_retirement.py >> logs/misp_cleanup.log 2>&1
+20 * * * *  cd /var/www/MISP/thaicert && flock -n /tmp/clean_hash_feed.lock ./clean_hash_feed.py >/dev/null 2>> logs/clean_hash_feed.err
+```
+
+Runtime files (`.env`, `*.ini`, `logs/`, `data/`, CSV reports) live next to the scripts and are git-ignored.
+
 ## Tests
 
 ```bash
