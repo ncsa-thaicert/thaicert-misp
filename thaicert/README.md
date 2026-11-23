@@ -1,3 +1,5 @@
+<p align="center"><img alt="ThaiCERT MISP" src="docs/images/thaicert-misp-logo.png" width="480"/></p>
+
 # ThaiCERT MISP Customisations
 
 ThaiCERT's maintenance scripts for its MISP instance. They keep `to_ids` (the IDS export flag) accurate, so the IOCs that MISP feeds to IDS/IPS, SIEM and firewalls are current and free of known-benign values.
